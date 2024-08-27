@@ -1,0 +1,15 @@
+__pycache__/*
+2024_Summer_Project_env/*
+ngrok.exe
+handle_keys.py
+openai_api.py
+flask_linebot_webhook_server.py
+computer_vision
+data_scraper
+workflow
+images
+cwa_opendata_scraper.py
+food_linebot_sample.py
+food_linebot_drive.py
+create_linebot_messages_sample.py
+import_modules.py
