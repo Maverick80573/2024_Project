@@ -73,15 +73,25 @@ def handle_message(event):
     user_message = event.message.text # 使用者傳過來的訊息
     api_key = keys["OPENAI_API_KEY"]
 
-    if '小幫手天氣如何' in user_message:
+    #if '小幫手天氣如何' in user_message:
         # 假定的格式: 特務P天氣如何 臺中市 桃園市 彰化市
-        responses = [TextMessage(text=handle_weather(user_id, user_message))]
-    elif "sample" in user_message:
+        #responses = [TextMessage(text=handle_weather(user_id, user_message))]
+    if "sample" in user_message:
         responses = [handle_sample(user_message)]
+    elif '美食推薦' in user_message:
+        responses = [morning_noon_evening_options()]
+    elif '請問您在台中哪個區域!' in user_message:
+        responses = [breakfast_choise()]
+    elif '請問您在台中哪個區域~' in user_message:
+        responses = [lunch_choise()]
+    elif '請問您在台中哪個區域?' in user_message:
+        responses = [dinner_choise()]
+    elif '大里區' in user_message:
+        responses = [dali()]
     else:# 閒聊
         responses = [
-            TextMessage(text=chat_with_chatgpt(user_id, user_message, api_key))
-            #TextMessage(text="Got it!")
+            #TextMessage(text=chat_with_chatgpt(user_id, user_message, api_key))
+            TextMessage(text="Got it!")
         ] 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -92,29 +102,29 @@ def handle_message(event):
             )
         )
 
-def handle_weather(user_id, user_message, chatgpt_api_key=keys['OPENAI_API_KEY']):
-    # 問天氣
-    cwa_api_key = keys['CWA_API_KEY']
-    locations_name = user_message.split()[1:] # 取得地點 > NLP:實體辨識
-    if locations_name: # 有地點才做事情
-        weather_data = get_cities_weather(cwa_api_key, locations_name)
-        response = ""
-        for location in weather_data: # 取得每一個縣市的名稱
-            response += f"{location}:\n" # 加入縣市名稱訊息到response
-            for weather_key in sorted(weather_data[location]): # 根據縣市名稱，取得縣市天氣資料
-                response += f"\t\t\t\t{weather_key}: {weather_data[location][weather_key]}\n"
-        response = response.strip()
-        response = chat_with_chatgpt(
-            user_id, response, chatgpt_api_key,
-            extra_prompt="請你幫我生出一段報導，根據前面的天氣資訊，建議使用者的穿搭等等，每個縣市分開，200字以內。"
-        )
-    else:
-        response = "請給我你想知道的縣市，請輸入：小幫手天氣如何 臺中市 桃園市 彰化市"
-    return response
+# def handle_weather(user_id, user_message, chatgpt_api_key=keys['OPENAI_API_KEY']):
+#     # 問天氣
+#     cwa_api_key = keys['CWA_API_KEY']
+#     locations_name = user_message.split()[1:] # 取得地點 > NLP:實體辨識
+#     if locations_name: # 有地點才做事情
+#         weather_data = get_cities_weather(cwa_api_key, locations_name)
+#         response = ""
+#         for location in weather_data: # 取得每一個縣市的名稱
+#             response += f"{location}:\n" # 加入縣市名稱訊息到response
+#             for weather_key in sorted(weather_data[location]): # 根據縣市名稱，取得縣市天氣資料
+#                 response += f"\t\t\t\t{weather_key}: {weather_data[location][weather_key]}\n"
+#         response = response.strip()
+#         response = chat_with_chatgpt(
+#             user_id, response, chatgpt_api_key,
+#             extra_prompt="請你幫我生出一段報導，根據前面的天氣資訊，建議使用者的穿搭等等，每個縣市分開，200字以內。"
+#         )
+#     else:
+#         response = "請給我你想知道的縣市，請輸入：小幫手天氣如何 臺中市 桃園市 彰化市"
+#     return response
 
 def handle_sample(user_message):
     if "按鈕sample" in user_message:
-        return create_buttons_template()
+        return morning_noon_evening_options()
     elif "輪播sample" in user_message:
         return create_carousel_template()
     elif "確認sample" in user_message:
