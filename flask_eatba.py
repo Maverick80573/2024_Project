@@ -1,59 +1,51 @@
-from flask import (
-    Flask, 
-    request, 
-    abort, 
-    render_template
-)
-from linebot.v3 import (
-    WebhookHandler
-)
-from linebot.v3.exceptions import (
-    InvalidSignatureError
-)
+import random
+from flask import Flask, request, abort, url_for
+from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    TextMessage,  # 傳輸回Line官方後台的資料格式
+    Configuration, ApiClient, MessagingApi, ReplyMessageRequest,
+    TextMessage, TemplateMessage, QuickReply, QuickReplyItem,
+    CarouselTemplate, CarouselColumn, ButtonsTemplate, 
+    PostbackAction, MessageAction, URIAction
 )
-from linebot.v3.webhooks import (
-    MessageEvent,FollowEvent, # 傳輸過來的方法
-    TextMessageContent, # 使用者傳過來的資料格式\
-)
+from linebot.v3.webhooks import MessageEvent, FollowEvent, TextMessageContent, PostbackEvent
 import pandas as pd
+from urllib.parse import parse_qsl, quote
+import logging, os
 from handle_keys import get_secret_and_token
-from import_modules import *
 from create_linebot_messages_sample import *
-from collections import defaultdict
 
 app = Flask(__name__)
 keys = get_secret_and_token()
 handler = WebhookHandler(keys['LINEBOT_SECRET_KEY'])
 configuration = Configuration(access_token=keys['LINEBOT_ACCESS_TOKEN'])
 
+# 靜態圖片資料夾路徑
+IMAGE_FOLDER = 'static/images'
+
+# 載入餐廳資料，包含圖片檔名
+rest_dict = {meal: pd.read_csv(f'taichungeatba/{meal}.csv').dropna(axis=1).groupby('區域')
+             for meal in ['breakfast_rest', 'lunch_rest', 'dinner_rest']}
+
+# 儲存使用者選擇的餐廳推薦資料
 rest_recommand_memory = dict()
 
-rest_dict = {
-    'breakfast_rest': pd.read_csv('taichungeatba/breakfast_rest.csv').dropna(axis=1).groupby('區域'),
-    'lunch_rest': pd.read_csv('taichungeatba/lunch_rest.csv').dropna(axis=1).groupby('區域'),
-    'dinner_rest': pd.read_csv('taichungeatba/dinner_rest.csv').dropna(axis=1).groupby('區域')
-}
+# 儲存使用者歷史紀錄
+user_history = dict()
+
+# 每頁顯示的區域數量
+ITEMS_PER_PAGE = 10
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    # get X-Line-Signature header value
     signature = request.headers['X-Line-Signature']
-
-    # get request body as text
     body = request.get_data(as_text=True)
     app.logger.info("Request body: " + body)
 
-    # handle webhook body
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        app.logger.info("Invalid signature. Please check your channel access token/channel secret.")
+        app.logger.info("Invalid signature.")
         abort(400)
 
     return 'OK'
@@ -61,114 +53,205 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id
-    user_message = event.message.text # 使用者傳過來的訊息
+    user_message = event.message.text
 
-    if "sample" in user_message:
-        responses = [handle_sample(user_message)]
-    elif '美食推薦' in user_message: # Get Time
-        responses = [handle_choose_time()]
-    elif user_message.startswith('#') and user_message.endswith('餐'): # Get Section
-        responses = [handle_choose_section(user_id, user_message)]
-    elif user_message.startswith('#') and user_message.endswith('區'): # Get recommand
-        section_name = user_message[1:]
-        responses = [handle_rests_recommand(user_id, section_name)]
-    else:# 閒聊
-        responses = [TextMessage(text='Got it!')] 
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=responses
+    known_commands = ["連絡電話", "餐廳評價","sample", "查看歷史推薦"]
+    if any(cmd in user_message for cmd in known_commands):
+        return  # 不回覆引導訊息，只處理按鈕的訊息
+
+    response = process_message(user_id, user_message)
+
+    if response:
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message_with_http_info(
+                ReplyMessageRequest(reply_token=event.reply_token, messages=[response])
             )
-        )
+    else:
+        app.logger.info(f"無效的訊息回應: {user_message}")
+
+def process_message(user_id, user_message):
+    if "sample" in user_message:
+        return handle_sample(user_message)
+    elif '美食推薦' in user_message:
+        return handle_choose_time()
+    elif '查看歷史推薦' in user_message:
+        return handle_view_history(user_id)
+    elif user_message.startswith('#'):
+        if 'next_page' in user_message or 'prev_page' in user_message or '第' in user_message:
+            return handle_pagination(user_id, user_message)
+        else:
+            return handle_hashtag_messages(user_id, user_message)
+    else:
+        return TextMessage(text="想吃什麼，就大聲說出來吧！輸入『美食推薦』，我來滿足你的味蕾！")
+
+def handle_view_history(user_id):
+    history = user_history.get(user_id, [])
+    if not history:
+        return TextMessage(text="目前尚無歷史推薦記錄。")
+    
+    quick_reply_items = [QuickReplyItem(action=MessageAction(text=item, label=item)) for item in history]
+    return TextMessage(text="以下是你最近的推薦記錄：", quickReply=QuickReply(items=quick_reply_items))
+
+def handle_hashtag_messages(user_id, user_message):
+    if user_message.endswith('餐'):
+        return handle_choose_section(user_id, user_message, page=1)
+    elif user_message.endswith('區'):
+        section_name = user_message[1:]
+        return handle_rests_recommand(user_id, section_name)
 
 def handle_choose_time():
+    actions = [
+        MessageAction(text='#文青早餐', label='享用文青早點'),
+        MessageAction(text='#在地午餐', label='品嘗在地美食'),
+        MessageAction(text='#高檔晚餐', label='暢享高檔餐廳')
+    ]
     response = ButtonsTemplate(
         thumbnail_image_url='https://i.imgur.com/b9oaYpu.jpeg',
         title='歡迎使用!!',
         text='請選擇要推薦的風格餐廳。',
-        actions=[
-            MessageAction(text='#文青早餐', label='享用文青早點'),
-            MessageAction(text='#在地午餐', label='品嘗在地美食'),
-            MessageAction(text='#高檔晚餐', label='暢享高檔餐廳')
-        ]
+        actions=actions
     )
-    return TemplateMessage(
-        type='template',
-        altText="TemplateMessage",
-        template=response
-    )
+    return TemplateMessage(altText="TemplateMessage", template=response)
 
-def handle_choose_section(user_id, time_message):
-    def create_quick_reply_item(section_name):
-        return QuickReplyItem(action=MessageAction(text=f'#{section_name}', label=f'{section_name}'))
-
-    if time_message == '#文青早餐':
-        rest_groups = rest_dict['breakfast_rest']
-    elif time_message == '#在地午餐':
-        rest_groups = rest_dict['lunch_rest']
-    elif time_message == '#高檔晚餐':
-        rest_groups = rest_dict['dinner_rest']
+def handle_choose_section(user_id, time_message, page=1):
+    meal_dict = {'#文青早餐': 'breakfast_rest', '#在地午餐': 'lunch_rest', '#高檔晚餐': 'dinner_rest'}
+    meal_type = meal_dict.get(time_message)
     
-    rest_recommand_memory[user_id] = rest_groups
+    if meal_type:
+        # 儲存所選擇的餐廳類型到使用者記憶體
+        rest_recommand_memory[user_id] = rest_dict[meal_type]
+        rest_recommand_memory[user_id].meal_type = meal_type  
+        sections = list(rest_recommand_memory[user_id].groups.keys())
 
+        return generate_quick_reply_with_pagination(user_id, sections, page)
+    
+    return None
 
-    sections = rest_groups.groups.keys()
-    quick_reply_items = [create_quick_reply_item(section) for section in sections]
-    quick_reply_body = QuickReply(items=quick_reply_items)
+def generate_quick_reply_with_pagination(user_id, sections, page):
+    # 分頁處理，檢查範圍是否有效
+    start_index = (page - 1) * ITEMS_PER_PAGE
+    end_index = start_index + ITEMS_PER_PAGE
+    total_pages = (len(sections) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE  # 計算總頁數
 
-    return TextMessage(
-        text="請選擇你的所在區域~",
-        quickReply=quick_reply_body
-    )
+    # 檢查是否超過可用資料範圍
+    if page > total_pages:
+        return TextMessage(text=f"這是最後一頁，已無更多資料可顯示。")
+
+    paged_sections = sections[start_index:end_index]
+    quick_reply_items = [QuickReplyItem(action=MessageAction(text=f'#{sec}', label=f'{sec}')) for sec in paged_sections]
+
+    # 顯示目前頁數
+    quick_reply_items.append(QuickReplyItem(action=MessageAction(text=f'#第{page}頁', label=f'第{page}頁')))
+
+    # 加入選擇頁數的按鈕
+    if page > 1:
+        quick_reply_items.append(QuickReplyItem(action=MessageAction(text=f'#第{page-1}頁', label=f'第{page-1}頁')))
+    if page < total_pages:
+        quick_reply_items.append(QuickReplyItem(action=MessageAction(text=f'#第{page+1}頁', label=f'第{page+1}頁')))
+
+    # 顯示總頁數
+    return TextMessage(text=f"目前在第{page}頁，共{total_pages}頁，請選擇你的所在區域~", quickReply=QuickReply(items=quick_reply_items))
+
+def handle_pagination(user_id, user_message):
+    # 提取頁碼，將「第X頁」轉換為數字
+    try:
+        # 使用正確的字串切割方式來提取頁碼
+        page = int(user_message.split('第')[1].split('頁')[0])
+    except (IndexError, ValueError):
+        app.logger.info(f"Invalid pagination command: {user_message}")
+        return TextMessage(text="無法識別的分頁指令")
+
+    app.logger.info(f"Handling pagination to page {page}")
+    
+    # 從記憶體中取出目前的餐廳區域
+    meal_type = rest_recommand_memory[user_id].meal_type
+    sections = list(rest_recommand_memory[user_id].groups.keys())
+
+    # 返回下一頁或指定頁的 QuickReply 物件
+    return generate_quick_reply_with_pagination(user_id, sections, page)
 
 def handle_rests_recommand(user_id, section_name):
-    def create_rest_col(rest_text, rest_title, rest_comment="",rest_address="",rest_phon="",rest_url=""):
-#       url = 'https://www.google.com'
-        address = rest_address if rest_address else '這是地址'
-        phon = rest_phon if rest_phon else '這是電話'
-        comment = rest_comment if rest_comment else '這是評論'
-        return CarouselColumn(
-            text=rest_text,
-            title=rest_title,
-            thumbnail_image_url='https://i.imgur.com/97LucO0.jpg',
-            actions=[
-                # MessageAction(label='餐廳地址', text=address),
-                # MessageAction(label='連絡電話', text=phon),
-                # MessageAction(label='餐廳評價', text=comment),
-                PostbackAction(label='餐廳地址', data=f'action=address&info={address}'),
-                PostbackAction(label='連絡電話', data=f'action=phon&info={phon}'),
-                PostbackAction(label='餐廳評價', data=f'action=comment&info={comment}')
+    def create_rest_col(name, opentime, phone, section, address, comment, image_file_folder):
+        address = address if address else '台中市政府'  # 如果沒有地址，使用一個預設位置
+        phone = phone if phone else '這是電話'
+        comment = comment if comment else '這是評論'
 
+        # 建立本地圖片 URL，隨機選擇一張圖片
+        folder_path = os.path.join(IMAGE_FOLDER, image_file_folder)
+        if image_file_folder and os.path.exists(folder_path):
+            # 列出資料夾內的圖片檔案
+            image_files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
+            if image_files:  # 確認資料夾內有圖片
+                image_file = random.choice(image_files)  # 隨機選擇圖片
+                image_url = url_for('static', filename=f'images/{image_file_folder}/{image_file}', _external=True, _scheme='https')
+            else:
+                image_url = 'https://i.imgur.com/97LucO0.jpg'  # 若資料夾內無圖片，使用預設圖片
+        else:
+            image_url = 'https://i.imgur.com/97LucO0.jpg'  # 預設圖片 URL
+
+        # 記錄日誌以檢查生成的圖片 URL
+        app.logger.info(f"Generated Image URL for {name}: {image_url}")
+        
+        # 使用 URIAction 讓地址點擊時打開 Google 地圖，地址需要進行 URL 編碼
+        encoded_address = quote(address)
+        map_url = f"https://www.google.com/maps/search/?api=1&query={encoded_address}"
+        text_for_postback = f"comment={name}の餐廳評價：{comment}"
+        text_for_phone = f"comment={name}の聯絡電話： {phone}"
+        
+        return CarouselColumn(
+            text=opentime, title=name, thumbnail_image_url=image_url,
+            actions=[
+                URIAction(label='餐廳地址', uri=map_url),
+                PostbackAction(
+                    label='聯絡電話',
+                    displayText=f'{name}の聯絡電話',
+                    data=text_for_phone
+                ),
+                PostbackAction(
+                    label='餐廳評價',
+                    displayText=f'{name}の餐廳評價',
+                    data=text_for_postback
+                ),
             ]
         )
+
+    group = rest_recommand_memory[user_id].get_group(section_name)
+   #samples = group.sample(min(len(group), 3))
+
+    columns = []
+    for rest in group.values:
+        # 根據 CSV 檔案中的列數調整解包數量
+        name, opentime, phone, section, address, comment = rest[:6]
+        image_file_folder = f'{section}_{name}'
+        columns.append(create_rest_col(name, opentime, phone, section, address, comment, image_file_folder))
     
-    def get_group_sample(group):
-        group_size = len(group)
-        return group.sample(min(group_size, 3))
+    # 確認生成的 columns 非空，否則返回錯誤消息
+    if not columns:
+        return TextMessage(text="找不到餐廳資料，請稍後再試！")
+    
+    # 紀錄歷史推薦
+    user_history.setdefault(user_id, []).append(section_name)
 
-    rests = rest_recommand_memory[user_id]
-    samples = rests.get_group(section_name).apply(get_group_sample)
-    carousel = CarouselTemplate(columns=[
-        create_rest_col(opentime, name, comment, address,phone)
-        for name, opentime, phone, section, address, comment in samples.values
-    ])
-    return TemplateMessage(
-        type='template',
-        altText="TemplateMessage",
-        template=carousel
-    )
+    return TemplateMessage(altText="TemplateMessage", template=CarouselTemplate(columns=columns))
 
-from urllib.parse import parse_qsl
-@handler.add(FollowEvent) 
-def handle_postback(event):
+@handler.add(FollowEvent)
+def handle_follow(event):
+    welcome_msg = "嗨！歡迎加入台中美食小幫手！想找美食嗎？輸入「美食推薦」就能開始你的美食探索之旅囉！"
     with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message_with_http_info(
+        MessagingApi(api_client).reply_message_with_http_info(
+            ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=welcome_msg)])
+        )
+
+@handler.add(PostbackEvent) 
+def handle_postback(event):
+    ts = event.postback.data
+    postback_data = {k:v for k,v in parse_qsl(ts)}
+    response = postback_data.get('comment', "Get PostBack Event!")  # 取得評價
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message_with_http_info(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="歡迎加入台中吃飽小幫手!!一起探索台中美味，發現更多好吃的餐廳吧!若要使用尋找美食功能，請輸入關鍵字<美食推薦>")]
+                messages=[TextMessage(text=response)]
             )
         )
 
@@ -182,6 +265,7 @@ def handle_sample(user_message):
     else:
         return create_quick_reply()
 
-
 if __name__ == "__main__":
+    # 設置日誌級別
+    logging.basicConfig(level=logging.INFO)
     app.run(debug=True)
